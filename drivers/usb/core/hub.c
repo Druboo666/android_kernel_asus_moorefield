@@ -118,7 +118,127 @@ EXPORT_SYMBOL_GPL(ehci_cf_port_reset_rwsem);
 #define HUB_DEBOUNCE_STABLE	 100
 
 static int usb_reset_and_verify_device(struct usb_device *udev);
-static void hub_release(struct kref *kref);
+=======
+/*
+ * USB hub driver.
+ *
+ * (C) Copyright 1999 Linus Torvalds
+ * (C) Copyright 1999 Johannes Erdfelt
+ * (C) Copyright 1999 Gregory P. Smith
+ * (C) Copyright 2001 Brad Hards (bhards@bigpond.net.au)
+ *
+ */
+
+#include <linux/kernel.h>
+#include <linux/errno.h>
+#include <linux/module.h>
+#include <linux/moduleparam.h>
+#include <linux/completion.h>
+#include <linux/sched.h>
+#include <linux/list.h>
+#include <linux/slab.h>
+#include <linux/ioctl.h>
+#include <linux/usb.h>
+#include <linux/usbdevice_fs.h>
+#include <linux/usb/hcd.h>
+#include <linux/usb/otg.h>
+#include <linux/usb/quirks.h>
+#include <linux/kthread.h>
+#include <linux/mutex.h>
+#include <linux/freezer.h>
+#include <linux/random.h>
+#include <linux/pm_qos.h>
+
+#include <asm/uaccess.h>
+#include <asm/byteorder.h>
+
+#include "hub.h"
+
+#ifdef CONFIG_USB_HCD_HSIC
+#include <linux/usb/ehci-tangier-hsic-pci.h>
+#endif
+
+/* if we are in debug mode, always announce new devices */
+#ifdef DEBUG
+#ifndef CONFIG_USB_ANNOUNCE_NEW_DEVICES
+#define CONFIG_USB_ANNOUNCE_NEW_DEVICES
+#endif
+#endif
+
+#define USB_VENDOR_GENESYS_LOGIC		0x05e3
+#define HUB_QUIRK_CHECK_PORT_AUTOSUSPEND	0x01
+
+static inline int hub_is_superspeed(struct usb_device *hdev)
+{
+	return (hdev->descriptor.bDeviceProtocol == USB_HUB_PR_SS);
+}
+
+/* Protect struct usb_device->state and ->children members
+ * Note: Both are also protected by ->dev.sem, except that ->state can
+ * change to USB_STATE_NOTATTACHED even when the semaphore isn't held. */
+static DEFINE_SPINLOCK(device_state_lock);
+
+/* khubd's worklist and its lock */
+static DEFINE_SPINLOCK(hub_event_lock);
+static LIST_HEAD(hub_event_list);	/* List of hubs needing servicing */
+
+/* Wakes up khubd */
+static DECLARE_WAIT_QUEUE_HEAD(khubd_wait);
+
+static struct task_struct *khubd_task;
+
+/* cycle leds on hubs that aren't blinking for attention */
+static bool blinkenlights = 0;
+module_param (blinkenlights, bool, S_IRUGO);
+MODULE_PARM_DESC (blinkenlights, "true to cycle leds on hubs");
+
+/*
+ * Device SATA8000 FW1.0 from DATAST0R Technology Corp requires about
+ * 10 seconds to send reply for the initial 64-byte descriptor request.
+ */
+/* define initial 64-byte descriptor request timeout in milliseconds */
+static int initial_descriptor_timeout = USB_CTRL_GET_TIMEOUT;
+module_param(initial_descriptor_timeout, int, S_IRUGO|S_IWUSR);
+MODULE_PARM_DESC(initial_descriptor_timeout,
+		"initial 64-byte descriptor request timeout in milliseconds "
+		"(default 5000 - 5.0 seconds)");
+
+/*
+ * As of 2.6.10 we introduce a new USB device initialization scheme which
+ * closely resembles the way Windows works.  Hopefully it will be compatible
+ * with a wider range of devices than the old scheme.  However some previously
+ * working devices may start giving rise to "device not accepting address"
+ * errors; if that happens the user can try the old scheme by adjusting the
+ * following module parameters.
+ *
+ * For maximum flexibility there are two boolean parameters to control the
+ * hub driver's behavior.  On the first initialization attempt, if the
+ * "old_scheme_first" parameter is set then the old scheme will be used,
+ * otherwise the new scheme is used.  If that fails and "use_both_schemes"
+ * is set, then the driver will make another attempt, using the other scheme.
+ */
+static bool old_scheme_first = 0;
+module_param(old_scheme_first, bool, S_IRUGO | S_IWUSR);
+MODULE_PARM_DESC(old_scheme_first,
+		 "start with the old device initialization scheme");
+
+static bool use_both_schemes = 1;
+module_param(use_both_schemes, bool, S_IRUGO | S_IWUSR);
+MODULE_PARM_DESC(use_both_schemes,
+		"try the other device initialization scheme if the "
+		"first one fails");
+
+/* Mutual exclusion for EHCI CF initialization.  This interferes with
+ * port reset on some companion controllers.
+ */
+DECLARE_RWSEM(ehci_cf_port_reset_rwsem);
+EXPORT_SYMBOL_GPL(ehci_cf_port_reset_rwsem);
+
+#define HUB_DEBOUNCE_TIMEOUT	2000
+#define HUB_DEBOUNCE_STEP	  25
+#define HUB_DEBOUNCE_STABLE	 100
+
+static int usb_reset_and_verify_device(struct usb_device *udev);
 
 static inline char *portspeed(struct usb_hub *hub, int portstatus)
 {
@@ -1032,20 +1152,10 @@ static void hub_activate(struct usb_hub *hub, enum hub_activation_type type)
 	unsigned delay;
 
 	/* Continue a partial initialization */
-	if (type == HUB_INIT2 || type == HUB_INIT3) {
-		device_lock(hub->intfdev);
-
-		/* Was the hub disconnected while we were waiting? */
-		if (hub->disconnected) {
-			device_unlock(hub->intfdev);
-			kref_put(&hub->kref, hub_release);
-			return;
-		}
-		if (type == HUB_INIT2)
-			goto init2;
+	if (type == HUB_INIT2)
+		goto init2;
+	if (type == HUB_INIT3)
 		goto init3;
-	}
-	kref_get(&hub->kref);
 
 	/* The superspeed hub except for root hub has to use Hub Depth
 	 * value as an offset into the route string to locate the bits
@@ -1242,7 +1352,6 @@ static void hub_activate(struct usb_hub *hub, enum hub_activation_type type)
 			PREPARE_DELAYED_WORK(&hub->init_work, hub_init_func3);
 			schedule_delayed_work(&hub->init_work,
 					msecs_to_jiffies(delay));
-			device_unlock(hub->intfdev);
 			return;		/* Continues at init3: below */
 		} else {
 			msleep(delay);
@@ -1263,11 +1372,6 @@ static void hub_activate(struct usb_hub *hub, enum hub_activation_type type)
 	/* Allow autosuspend if it was suppressed */
 	if (type <= HUB_INIT3)
 		usb_autopm_put_interface_async(to_usb_interface(hub->intfdev));
-
-	if (type == HUB_INIT2 || type == HUB_INIT3)
-		device_unlock(hub->intfdev);
-
-	kref_put(&hub->kref, hub_release);
 }
 
 /* Implement the continuations for the delays above */
@@ -1728,14 +1832,8 @@ static int hub_probe(struct usb_interface *intf, const struct usb_device_id *id)
 	 * - Change autosuspend delay of hub can avoid unnecessary auto
 	 *   suspend timer for hub, also may decrease power consumption
 	 *   of USB bus.
-	 *
-	 * - If user has indicated to prevent autosuspend by passing
-	 *   usbcore.autosuspend = -1 then keep autosuspend disabled.
 	 */
-#ifdef CONFIG_PM_RUNTIME
-	if (hdev->dev.power.autosuspend_delay >= 0)
-		pm_runtime_set_autosuspend_delay(&hdev->dev, 0);
-#endif
+	pm_runtime_set_autosuspend_delay(&hdev->dev, 50); //50ms
 
 	/*
 	 * Hubs have proper suspend/resume support, except for root hubs
@@ -3348,10 +3446,10 @@ int usb_port_resume(struct usb_device *udev, pm_message_t msg)
 		dev_dbg(hub->intfdev, "can't resume port %d, status %d\n",
 				port1, status);
 	} else {
-		/* drive resume for at least 20 msec */
+		/* drive resume for USB_RESUME_TIMEOUT msec */
 		dev_dbg(&udev->dev, "usb %sresume\n",
 				(PMSG_IS_AUTO(msg) ? "auto-" : ""));
-		msleep(25);
+		msleep(USB_RESUME_TIMEOUT);
 
 		/* Virtual root hubs can trigger on GET_PORT_STATUS to
 		 * stop resume signaling.  Then finish the resume
@@ -4241,7 +4339,7 @@ hub_port_init (struct usb_hub *hub, struct usb_device *udev, int port1,
 
 			retval = hub_port_reset(hub, port1, udev, delay, false);
 			if (retval < 0){		/* error or disconnect */
-				/* disable ep0 */
+			        /* disable ep0 */
                                 usb_disable_endpoint(udev, 0 + USB_DIR_IN, true);
                                 usb_disable_endpoint(udev, 0 + USB_DIR_OUT, true);
                                 goto fail;
