@@ -52,7 +52,6 @@
 #include <linux/usb/usbnet.h>
 #include <linux/usb/cdc.h>
 #include <linux/usb/cdc_ncm.h>
-#include <linux/wait.h>
 
 #define	DRIVER_VERSION				"14-Mar-2012"
 
@@ -64,18 +63,10 @@ static bool prefer_mbim;
 module_param(prefer_mbim, bool, S_IRUGO | S_IWUSR);
 MODULE_PARM_DESC(prefer_mbim, "Prefer MBIM setting on dual NCM/MBIM functions");
 
-#define WAIT_NET_CARRIER_EVENT_WHEN_CLOSE
-
-#ifdef WAIT_NET_CARRIER_EVENT_WHEN_CLOSE
-extern wait_queue_head_t net_carrier_wq;
-#endif
-
 static void cdc_ncm_txpath_bh(unsigned long param);
 static void cdc_ncm_tx_timeout_start(struct cdc_ncm_ctx *ctx);
 static enum hrtimer_restart cdc_ncm_tx_timer_cb(struct hrtimer *hr_timer);
-static const struct driver_info cdc_ncm_info, cdc_ncm_info_alt;
 static struct usb_driver cdc_ncm_driver;
-static const struct ethtool_ops cdc_ncm_ethtool_ops;
 
 static void
 cdc_ncm_get_drvinfo(struct net_device *net, struct ethtool_drvinfo *info)
@@ -122,13 +113,6 @@ static u8 cdc_ncm_setup(struct cdc_ncm_ctx *ctx)
 	/* devices prior to NCM Errata shall set this field to zero */
 	ctx->tx_max_datagrams = le16_to_cpu(ctx->ncm_parm.wNtbOutMaxDatagrams);
 	ntb_fmt_supported = le16_to_cpu(ctx->ncm_parm.bmNtbFormatsSupported);
-
-	/* get device flags only once */
-	ctx->device_flags = dev->driver_info->flags;
-	if (ctx->device_flags & FLAG_NO_PADDING_TX)
-		pr_info("NCM PADDING TX disabled\n");
-	else
-		pr_info("NCM PADDING TX enabled\n");
 
 	eth_hlen = ETH_HLEN;
 	min_dgram_size = CDC_NCM_MIN_DATAGRAM_SIZE;
@@ -493,6 +477,13 @@ advance:
 	if (cdc_ncm_setup(ctx))
 		goto error2;
 
+	/* Some firmwares need a pause here or they will silently fail
+	 * to set up the interface properly.  This value was decided
+	 * empirically on a Sierra Wireless MC7455 running 02.08.02.00
+	 * firmware.
+	 */
+	usleep_range(10000, 20000);
+
 	/* configure data interface */
 	temp = usb_set_interface(dev->udev, iface_no, data_altsetting);
 	if (temp)
@@ -614,32 +605,13 @@ EXPORT_SYMBOL_GPL(cdc_ncm_select_altsetting);
 
 static int cdc_ncm_bind(struct usbnet *dev, struct usb_interface *intf)
 {
-	int ret;
-
 	/* MBIM backwards compatible function? */
 	cdc_ncm_select_altsetting(dev, intf);
 	if (cdc_ncm_comm_intf_is_mbim(intf->cur_altsetting))
 		return -ENODEV;
 
 	/* NCM data altsetting is always 1 */
-	ret = cdc_ncm_bind_common(dev, intf, 1);
-	if (!ret) {
-		/*
-		 * We should get an event when network connection is "connected"
-		 * or "disconnected". Set network connection in "disconnected"
-		 * state (carrier is OFF) during attach, so the IP network stack
-		 * does not start IPv6 negotiation and more.
-		 */
-		usbnet_link_change(dev, 0, 0);
-	}
-	return ret;
-}
-
-static int cdc_ncm_bind_alt(struct usbnet *dev, struct usb_interface *intf)
-{
-	dev_info(&dev->udev->dev, "Use of alternate settings\n");
-	dev->net->addr_len = 1;
-	return cdc_ncm_bind(dev, intf);
+	return cdc_ncm_bind_common(dev, intf, 1);
 }
 
 static void cdc_ncm_align_tail(struct sk_buff *skb, size_t modulus, size_t remainder, size_t max)
@@ -822,8 +794,7 @@ cdc_ncm_fill_tx_frame(struct cdc_ncm_ctx *ctx, struct sk_buff *skb, __le32 sign)
 	 * efficient for USB HS mobile device with DMA engine to receive a full
 	 * size NTB, than canceling DMA transfer and receiving a short packet.
 	 */
-	/* Tx padding is a device option */
-	if ((ctx->device_flags & FLAG_NO_PADDING_TX) == 0 && skb_out->len > CDC_NCM_MIN_TX_PKT)
+	if (skb_out->len > CDC_NCM_MIN_TX_PKT)
 		/* final zero padding */
 		memset(skb_put(skb_out, ctx->tx_max - skb_out->len), 0, ctx->tx_max - skb_out->len);
 
@@ -946,12 +917,6 @@ int cdc_ncm_rx_verify_nth16(struct cdc_ncm_ctx *ctx, struct sk_buff *skb_in)
 		goto error;
 	}
 
-	if (len != skb_in->len) {
-		pr_debug("invalid NTB block size %u vs %u\n", skb_in->len, len);
-
-		goto error;
-	}
-
 	if ((ctx->rx_seq + 1) != le16_to_cpu(nth16->wSequence) &&
 		(ctx->rx_seq || le16_to_cpu(nth16->wSequence)) &&
 		!((ctx->rx_seq == 0xffff) && !le16_to_cpu(nth16->wSequence))) {
@@ -1000,115 +965,6 @@ error:
 }
 EXPORT_SYMBOL_GPL(cdc_ncm_rx_verify_ndp16);
 
-/* handle NTB fragments recombination if needed (limited to 2 fragments)      */
-/* return:                                                                    */
-/*  0: valid NTB packet to be processed                                       */
-/*  1: invalid NTB packet                                                     */
-static inline int cdc_ncm_handle_fragments_recombination(
-					struct cdc_ncm_ctx *ctx,
-					struct sk_buff *skb_in,
-					int *ndpoffset)
-{
-	int len;
-	int i;
-	char *pc, *pcd;
-
-	if (*ndpoffset >= 0) {
-
-		/* valid NTD packet */
-		/* delete saved fragment if existing since flow back to normal*/
-		if (ctx->fragment_size) {
-
-			kfree(ctx->fragment);
-			ctx->fragment_size = 0;
-			pr_debug("frag deleted (%d) due to valid flow\n",
-				(int)(++ctx->fragment_deleted));
-		}
-		return 0;
-	}
-
-	/* invalid NTD packet */
-
-	if (ctx->fragment_size == 0) {
-
-		/* Save the current fragment */
-		ctx->fragment = kmalloc(skb_in->len, GFP_ATOMIC);
-		if (ctx->fragment == NULL) {
-			pr_debug("frag deleted (%d) due to kmalloc error\n",
-			(int)(++ctx->fragment_deleted));
-			return 1;
-		}
-		memcpy(ctx->fragment,
-			(unsigned char *)skb_in->data, skb_in->len);
-		ctx->fragment_size = skb_in->len;
-		pr_debug("frag saved\n");
-		return 1;
-	}
-
-	/* Try to recombinate current fragment with saved one (in skbuff) */
-
-	/* If skbuff is too small for the 2 fragments */
-	/* then delete previous fragment and save the current one */
-	len = skb_in->len;
-	if (ctx->fragment_size > skb_tailroom(skb_in)) {
-
-		kfree(ctx->fragment);
-		ctx->fragment_size = 0;
-		pr_debug("frag deleted (%d) due to size\n",
-			(int)(++ctx->fragment_deleted));
-
-		ctx->fragment = kmalloc(len, GFP_ATOMIC);
-		if (ctx->fragment == NULL) {
-			pr_debug("frag deleted (%d) due to kmalloc error\n",
-			(int)(++ctx->fragment_deleted));
-			return 1;
-		}
-		memcpy(ctx->fragment, skb_in->data, len);
-		ctx->fragment_size = len;
-		pr_debug("frag saved\n");
-
-		return 1;
-	}
-
-	/* recombinate current fragment with saved one (in skbuff) */
-	skb_put(skb_in, ctx->fragment_size);
-
-	pc = (unsigned char *)(skb_in->data); /* need to memcpy by the end */
-	pcd = pc + ctx->fragment_size;
-	pc = pc + len - 1;
-	pcd = pcd + len - 1;
-	for (i = 0; i < len; i++)
-		*pcd-- = *pc--;
-
-	memcpy(skb_in->data, ctx->fragment, ctx->fragment_size);
-
-	kfree(ctx->fragment);
-	ctx->fragment_size = 0;
-
-	/* test the recombination and deliver it if ok */
-	*ndpoffset = cdc_ncm_rx_verify_nth16(ctx, skb_in);
-	if (*ndpoffset >= 0) {
-		ctx->fragment_recombinated += 2;
-		pr_debug("frag successfully recombinated (%d)\n",
-			(int)ctx->fragment_recombinated);
-		return 0;
-	}
-
-	/* Else delete previous fragment and save the current one */
-	pr_debug("frag deleted (%d) due to recombination error\n",
-			(int)(++ctx->fragment_deleted));
-	ctx->fragment = kmalloc(len, GFP_ATOMIC);
-	if (ctx->fragment == NULL) {
-		pr_debug("frag deleted (%d) due to kmalloc error\n",
-			(int)(++ctx->fragment_deleted));
-		return 1;
-	}
-	memcpy(ctx->fragment, ++pcd, len);
-	ctx->fragment_size = len;
-	pr_debug("frag saved\n");
-	return 1;
-}
-
 static int cdc_ncm_rx_fixup(struct usbnet *dev, struct sk_buff *skb_in)
 {
 	struct sk_buff *skb;
@@ -1122,13 +978,9 @@ static int cdc_ncm_rx_fixup(struct usbnet *dev, struct sk_buff *skb_in)
 	int ndpoffset;
 	int loopcount = 50; /* arbitrary max preventing infinite loop */
 
-	if (ctx == NULL)
-		goto error;
-
 	ndpoffset = cdc_ncm_rx_verify_nth16(ctx, skb_in);
-
-	if (cdc_ncm_handle_fragments_recombination(ctx, skb_in, &ndpoffset))
-		return 1;
+	if (ndpoffset < 0)
+		goto error;
 
 next_ndp:
 	nframes = cdc_ncm_rx_verify_ndp16(skb_in, ndpoffset);
@@ -1173,7 +1025,6 @@ next_ndp:
 			if (!skb)
 				goto error;
 			skb->len = len;
-			skb->truesize = len + sizeof(struct sk_buff);
 			skb->data = ((u8 *)skb_in->data) + offset;
 			skb_set_tail_pointer(skb, len);
 			usbnet_skb_return(dev, skb);
@@ -1254,10 +1105,7 @@ static void cdc_ncm_status(struct usbnet *dev, struct urb *urb)
 		printk(KERN_INFO KBUILD_MODNAME ": %s: network connection:"
 			" %sconnected\n",
 			ctx->netdev->name, ctx->connected ? "" : "dis");
-#ifdef WAIT_NET_CARRIER_EVENT_WHEN_CLOSE
-		if (!ctx->connected)
-			wake_up_interruptible(&net_carrier_wq);
-#endif
+
 		usbnet_link_change(dev, ctx->connected, 0);
 		if (!ctx->connected)
 			ctx->tx_speed = ctx->rx_speed = 0;
@@ -1307,27 +1155,10 @@ static void cdc_ncm_disconnect(struct usb_interface *intf)
 	usbnet_disconnect(intf);
 }
 
-static int cdc_ncm_manage_power(struct usbnet *dev, int status)
-{
-	dev->intf->needs_remote_wakeup = status;
-	return 0;
-}
-
-static const struct driver_info cdc_ncm_info_alt = {
-	.description = "CDC NCM",
-	.flags = FLAG_POINTTOPOINT | FLAG_NO_SETINT | FLAG_MULTI_PACKET | FLAG_NO_PADDING_TX,
-	.bind = cdc_ncm_bind_alt,
-	.unbind = cdc_ncm_unbind,
-	.check_connect = cdc_ncm_check_connect,
-	.manage_power = cdc_ncm_manage_power,
-	.status = cdc_ncm_status,
-	.rx_fixup = cdc_ncm_rx_fixup,
-	.tx_fixup = cdc_ncm_tx_fixup,
-};
-
 static const struct driver_info cdc_ncm_info = {
 	.description = "CDC NCM",
-	.flags = FLAG_POINTTOPOINT | FLAG_NO_SETINT | FLAG_MULTI_PACKET,
+	.flags = FLAG_POINTTOPOINT | FLAG_NO_SETINT | FLAG_MULTI_PACKET
+			| FLAG_LINK_INTR,
 	.bind = cdc_ncm_bind,
 	.unbind = cdc_ncm_unbind,
 	.check_connect = cdc_ncm_check_connect,
@@ -1341,7 +1172,7 @@ static const struct driver_info cdc_ncm_info = {
 static const struct driver_info wwan_info = {
 	.description = "Mobile Broadband Network Device",
 	.flags = FLAG_POINTTOPOINT | FLAG_NO_SETINT | FLAG_MULTI_PACKET
-			| FLAG_WWAN,
+			| FLAG_LINK_INTR | FLAG_WWAN,
 	.bind = cdc_ncm_bind,
 	.unbind = cdc_ncm_unbind,
 	.check_connect = cdc_ncm_check_connect,
@@ -1355,7 +1186,7 @@ static const struct driver_info wwan_info = {
 static const struct driver_info wwan_noarp_info = {
 	.description = "Mobile Broadband Network Device (NO ARP)",
 	.flags = FLAG_POINTTOPOINT | FLAG_NO_SETINT | FLAG_MULTI_PACKET
-			| FLAG_WWAN | FLAG_NOARP,
+			| FLAG_LINK_INTR | FLAG_WWAN | FLAG_NOARP,
 	.bind = cdc_ncm_bind,
 	.unbind = cdc_ncm_unbind,
 	.check_connect = cdc_ncm_check_connect,
@@ -1366,21 +1197,6 @@ static const struct driver_info wwan_noarp_info = {
 };
 
 static const struct usb_device_id cdc_devs[] = {
-	{ .match_flags = USB_DEVICE_ID_MATCH_INT_INFO
-			| USB_DEVICE_ID_MATCH_VENDOR
-			| USB_DEVICE_ID_MATCH_PRODUCT,
-	  .bInterfaceClass = USB_CLASS_COMM,
-	  .bInterfaceSubClass = USB_CDC_SUBCLASS_NCM,
-	  .bInterfaceProtocol = (USB_CDC_PROTO_NONE),
-	  .idVendor = 0x1519,
-	  .idProduct = 0x0452,
-	  .driver_info = (unsigned long)&cdc_ncm_info_alt
-	},
-	{ USB_INTERFACE_INFO(USB_CLASS_COMM, USB_CDC_SUBCLASS_NCM,
-				USB_CDC_PROTO_NONE),
-		  .driver_info = (unsigned long)&cdc_ncm_info
-	},
-
 	/* Ericsson MBM devices like F5521gw */
 	{ .match_flags = USB_DEVICE_ID_MATCH_INT_INFO
 		| USB_DEVICE_ID_MATCH_VENDOR,
